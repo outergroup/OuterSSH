@@ -1,12 +1,8 @@
 #!/bin/bash
 # Builds a universal outerssh for macOS 12 and later. It uses CryptoKit and Security
 # for cryptography, so it needs nothing beyond the operating system.
-# Run it from the repository root.
-#
-# Set MACOS_SIGNING_IDENTITY to sign it with a Developer ID Application certificate
-# from the keychain. To also notarize it, set NOTARY_KEYCHAIN_PROFILE to a profile
-# saved with `xcrun notarytool store-credentials`, or set APPLE_API_KEY_PATH,
-# APPLE_API_KEY_ID and APPLE_API_ISSUER_ID to use an App Store Connect API key.
+# Run it from the repository root. Release/sign_macos.sh describes the environment
+# variables that sign and notarize it.
 set -euo pipefail
 
 [[ $# -eq 2 ]] || { echo "Usage: $0 VERSION OUTPUT_DIRECTORY" >&2; exit 1; }
@@ -42,29 +38,7 @@ if nm "$binary" | grep -i openssl >/dev/null; then
 fi
 "$binary" --version
 
-if [[ -n "${MACOS_SIGNING_IDENTITY:-}" ]]; then
-    codesign --force --options runtime --timestamp --sign "$MACOS_SIGNING_IDENTITY" \
-        --identifier org.outerssh.outerssh "$binary"
-    codesign --verify --strict --verbose=2 "$binary"
-    submission="$build/outerssh-notarization.zip"
-    ditto -c -k "$binary" "$submission"
-    credentials=()
-    if [[ -n "${NOTARY_KEYCHAIN_PROFILE:-}" ]]; then
-        credentials=(--keychain-profile "$NOTARY_KEYCHAIN_PROFILE")
-    elif [[ -n "${APPLE_API_KEY_PATH:-}" ]]; then
-        credentials=(--key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER_ID")
-    fi
-    if [[ ${#credentials[@]} -gt 0 ]]; then
-        result="$(xcrun notarytool submit "$submission" "${credentials[@]}" --wait --output-format json)"
-        echo "$result"
-        if [[ "$(plutil -extract status raw -o - - <<<"$result")" != "Accepted" ]]; then
-            echo "Error: notarization was not accepted." >&2
-            exit 1
-        fi
-    else
-        echo "Signed without notarizing: no notarization credentials were set."
-    fi
-fi
+Release/sign_macos.sh "$binary" org.outerssh.outerssh
 
 package="$build/package"
 mkdir -p "$package"
