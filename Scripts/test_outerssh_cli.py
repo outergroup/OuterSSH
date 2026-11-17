@@ -38,22 +38,26 @@ class CLI:
         self.output = b""
         self.status = None
 
+    def read_available(self, timeout):
+        if not select.select([self.terminal], [], [], timeout)[0]:
+            return True
+        try:
+            data = os.read(self.terminal, 65536)
+        except OSError as error:
+            if error.errno != errno.EIO:
+                raise
+            data = b""
+        self.output += data
+        return bool(data)
+
     def expect(self, pattern):
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             match = re.search(pattern, self.output)
             if match:
                 return match
-            if select.select([self.terminal], [], [], 0.1)[0]:
-                try:
-                    data = os.read(self.terminal, 65536)
-                except OSError as error:
-                    if error.errno != errno.EIO:
-                        raise
-                    data = b""
-                if not data:
-                    break
-                self.output += data
+            if not self.read_available(0.1):
+                break
         raise AssertionError(f"Missing {pattern!r}: {self.output.decode(errors='replace')}")
 
     def reply(self, text):
@@ -66,7 +70,8 @@ class CLI:
             if pid:
                 self.status = os.waitstatus_to_exitcode(status)
                 break
-            time.sleep(0.02)
+            if not self.read_available(0.02):
+                time.sleep(0.02)
         assert self.status == expected, (self.status, self.output)
 
     def close(self):
@@ -77,7 +82,9 @@ class CLI:
             finally:
                 if self.status is None:
                     os.kill(self.pid, signal.SIGKILL)
+                    os.close(self.terminal)
                     os.waitpid(self.pid, 0)
+                    return
         os.close(self.terminal)
 
 
@@ -311,6 +318,8 @@ def main():
         cli.reply("passphrase")
         if args.apple_crypto:
             cli.expect(b"Apple crypto does not support encrypted private-key files")
+            cli.expect(b"password: ")
+            os.kill(cli.pid, signal.SIGTERM)
             cli.wait(expected=1)
         else:
             relay(ready(cli), echo.server_address[1])
@@ -376,7 +385,7 @@ def main():
         os.kill(cli.pid, signal.SIGTERM)
         cli.wait()
         cli = alias("NoAgent", env=agent_environment)
-        cli.expect(b"no configured identity or SSH agent")
+        cli.expect(b"no identity, SSH agent, or password authentication")
         cli.wait(1)
         with (root / "aliases").open("a") as config:
             config.write("Host DirectOverride\n    ProxyJump missing-gateway.invalid\n"

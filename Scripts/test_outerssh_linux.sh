@@ -29,4 +29,5 @@ docker "${RUN_ARGS[@]}" \
         cmake --build /build --parallel 4
         ctest --test-dir /build --output-on-failure
         python3 Scripts/Linux/run_integration.py /build
+        python3 Scripts/Linux/run_cli_passwords.py /build
     '

@@ -226,6 +226,10 @@ done:
     return result;
 }
 
+#ifndef _WIN32
+static volatile sig_atomic_t stopped;
+#endif
+
 bool cli_prompt(const char *prompt, char *buffer, size_t capacity, bool echo)
 {
     if (capacity < 2) return false;
@@ -261,8 +265,14 @@ bool cli_prompt(const char *prompt, char *buffer, size_t capacity, bool echo)
     if (tcsetattr(input, TCSAFLUSH, &changed) != 0) { close(input); return false; }
     fputs(prompt, stderr); fflush(stderr);
     for (;;) {
+        struct pollfd ready = {.fd = input, .events = POLLIN};
+        int polled = poll(&ready, 1, 100);
+        if (stopped) { ok = false; break; }
+        if (polled < 0 && errno == EINTR) continue;
+        if (polled == 0) continue;
         char byte;
         ssize_t count = read(input, &byte, 1);
+        if (count < 0 && errno == EINTR) continue;
         if (count <= 0) { ok = false; break; }
         if (byte == '\n' || byte == '\r') break;
         if (length + 1 < capacity) buffer[length++] = byte;
@@ -404,7 +414,6 @@ void cli_semaphore_destroy(void *pointer)
     pthread_mutex_destroy(&semaphore->mutex);
     free(semaphore);
 }
-static volatile sig_atomic_t stopped;
 static void stop_signal(int number) { (void)number; stopped = 1; }
 bool cli_prepare_signals(void)
 {

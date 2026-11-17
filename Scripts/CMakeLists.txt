@@ -13,9 +13,8 @@ function(add_flow_test name)
         target_compile_options(${name} PRIVATE /UNDEBUG /W4 /WX
             /wd4505 /wd4100 /wd4459 /wd4702 /Gy /Gw)
     else()
-        target_compile_options(${name} PRIVATE -UNDEBUG
-            -Wall -Wextra -Werror -Wno-unused-function -Wno-unused-parameter
-            -ffunction-sections -fdata-sections)
+        target_compile_options(${name} PRIVATE "$<$<COMPILE_LANGUAGE:C>:-UNDEBUG;-Wall;-Wextra;-Werror;\
+-Wno-unused-function;-Wno-unused-parameter;-ffunction-sections;-fdata-sections>")
     endif()
     if(WIN32 OR name STREQUAL "ssh_socket_preparation_flows")
         target_sources(${name} PRIVATE "UnusedFlowDependencies.c")
@@ -27,7 +26,7 @@ function(add_flow_test name)
             target_link_options(${name} PRIVATE -Wl,/OPT:REF -Wl,/INCREMENTAL:NO)
         endif()
     elseif(APPLE)
-        target_link_options(${name} PRIVATE -Wl,-dead_strip)
+        target_link_options(${name} PRIVATE LINKER:-dead_strip)
     else()
         target_link_options(${name} PRIVATE -Wl,--gc-sections)
     endif()
@@ -57,7 +56,7 @@ add_flow_test(otqueue_contract)
 add_flow_test(ssh_session_start SSHProxyError.c)
 target_link_libraries(ssh_session_start PRIVATE OuterSSH ${OUTERSSH_CRYPTO_LIBRARIES})
 
-if(NOT OUTERSSH_WINDOWS_CRYPTO)
+if(NOT OUTERSSH_WINDOWS_CRYPTO AND NOT OUTERSSH_APPLE_CRYPTO)
 add_test(NAME ssh_session_start_software COMMAND ssh_session_start chacha20-poly1305@openssh.com)
 set_tests_properties(ssh_session_start_software PROPERTIES
     ENVIRONMENT "OPENSSL_armcap=0;OPENSSL_ia32cap=0:0")

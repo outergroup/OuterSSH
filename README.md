@@ -26,21 +26,25 @@ license in `OuterSSH/olibssh/libssh2/COPYING`. `OuterSSH/llhttp` is
 ## Building
 
 OuterSSH builds with CMake 3.24+ on macOS, Linux, Windows, and Android. It needs
-a C17 compiler, zlib, and `patch`. It uses OpenSSL 3 for cryptography, except on
-Windows, which uses CNG, and optionally on Android, which can use the platform's
-cryptography.
+a C17 compiler, zlib, and `patch`. It uses the platform's cryptography on macOS
+(CryptoKit and Security) and Windows (CNG), and optionally on Android. Elsewhere it
+uses OpenSSL 3.
 
-On macOS, with CMake, Ninja, and OpenSSL 3 from Homebrew:
+On macOS, with the Xcode command-line tools, CMake, and Ninja:
 
 ```sh
-cmake -S OuterSSH -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
+cmake -S OuterSSH -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ./build/outerssh --help
 ```
 
-On Linux, install OpenSSL and zlib development packages and drop the
-`OPENSSL_ROOT_DIR` setting. `OuterSSHCLI/README.md` has Windows instructions.
+Apple cryptography is written in Swift, which CMake builds only with the Ninja or
+Xcode generator. To use OpenSSL on macOS instead, add `-DOUTERSSH_APPLE_CRYPTO=OFF`
+and `-DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"`. Apple cryptography doesn't
+read encrypted private-key files; use an SSH agent for those keys.
+
+On Linux, install OpenSSL and zlib development packages and use the same command.
+`OuterSSHCLI/README.md` has Windows instructions.
 
 Building from the top level builds the library, the CLI, and the tests. When
 OuterSSH is added to another CMake project with `add_subdirectory`, the CLI and
@@ -49,8 +53,7 @@ tests are off by default; link `OuterSSH::OuterSSH`.
 ## Testing
 
 ```sh
-cmake -S OuterSSH -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DOUTERSSH_SANITIZE=ON \
-  -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
+cmake -S OuterSSH -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DOUTERSSH_SANITIZE=ON
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```

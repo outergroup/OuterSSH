@@ -11,18 +11,21 @@ and proxy authentication are disabled by default.
 Run these commands from the folder that contains `OuterSSH/`: the root of the
 OuterSSH repository, or `OuterLoop/` in the Outer Loop repository.
 
-On macOS, install CMake, Ninja, and OpenSSL 3 (for example with Homebrew):
+On macOS, install the Xcode command-line tools, CMake, and Ninja. The CLI uses
+CryptoKit and Security for cryptography, so it needs no other libraries:
 
 ```sh
 cmake -S OuterSSH -B build/outerssh -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
-  -DOUTERSSH_BUILD_CLI=ON -DOUTERSSH_BUILD_TESTS=OFF
+  -DCMAKE_BUILD_TYPE=Release -DOUTERSSH_BUILD_CLI=ON -DOUTERSSH_BUILD_TESTS=OFF
 cmake --build build/outerssh --target outerssh
 ./build/outerssh/outerssh --help
 ```
 
+Apple cryptography doesn't read encrypted private-key files, so `outerssh` skips
+them with a message; load such keys into an SSH agent. To use OpenSSL instead, add
+`-DOUTERSSH_APPLE_CRYPTO=OFF -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"`.
 In the Outer Loop repository, the `OuterSSHCLI` scheme in `OuterLoop.xcodeproj` also
-builds it, using Apple's cryptography instead of OpenSSL.
+builds it.
 
 On Linux, install a C17 compiler, CMake 3.24+, OpenSSL, zlib, and `patch`.
 `Scripts/Linux/Dockerfile` provides a complete build and test environment. The CLI handles its event queue's events on a Dispatch queue on macOS
@@ -95,7 +98,7 @@ outerssh -D 1080 -i ~/.ssh/id_ed25519 user@server
 # Prompt for an encrypted private key's passphrase.
 outerssh -D 1080 -i ~/.ssh/id_ed25519 --ask-passphrase user@server
 
-# Prompt for an SSH password.
+# Prompt for the SSH password without trying keys or the agent first.
 outerssh -D 1080 --password user@server
 
 # Use a different SSH port or let the OS choose the proxy port.
@@ -271,8 +274,12 @@ to unauthenticated access.
 
 This is a focused TCP forwarding tool, not a complete OpenSSH frontend. It uses
 OpenSSH to resolve configuration, but OuterSSH still owns every SSH connection, including
-jump hosts. `ProxyCommand`, remote commands, and UDP are unsupported. It follows Outer Loop's first-existing-key
-selection rather than OpenSSH's full sequence of authentication methods. Encrypted
+jump hosts. `ProxyCommand`, remote commands, and UDP are unsupported. It tries the
+first configured key that exists, or else the agent, rather than OpenSSH's full
+sequence of keys. Like OpenSSH, it then prompts for a password when the server
+rejects them or there are none, up to `NumberOfPasswordPrompts` times, unless batch
+mode is on or both `PasswordAuthentication` and `KbdInteractiveAuthentication` are
+off. It keeps the password in memory to reconnect. Encrypted
 keys require `--ask-passphrase` unless the configured agent can unlock them. It does
 not package the remote Unix socket bridge helpers. SSH passwords and key passphrases are read from a terminal,
 not command-line arguments.
@@ -286,6 +293,9 @@ python3 Scripts/test_outerssh_cli.py /path/to/outerssh
 bash Scripts/test_proxy_socks_handshake.sh
 bash Scripts/test_ssh_listener_flows.sh
 ```
+
+For a build with Apple cryptography, the macOS default, add `--apple-crypto`, which
+expects encrypted key files to be skipped.
 
 The integration test runs on macOS and Linux using `sshd`, `ssh-keygen`, `ssh-agent`, and `ssh-add`.
 It starts only loopback listeners and generates keys, an SSH configuration, a

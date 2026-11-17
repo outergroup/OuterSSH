@@ -23,6 +23,10 @@ static void clear_secret(void *memory, size_t length)
     while (length-- != 0) *bytes++ = 0;
 }
 
+#ifndef OUTERSSH_CLI_VERSION
+#define OUTERSSH_CLI_VERSION "development"
+#endif
+
 static void usage(FILE *stream)
 {
     fprintf(stream,
@@ -39,7 +43,7 @@ static void usage(FILE *stream)
         "  -i path                  Private key (overrides configured identity)\n"
         "  -F path                  Alternate OpenSSH configuration file\n"
         "  --ask-passphrase         Prompt for the private key's passphrase\n"
-        "  --password               Prompt for the SSH password instead of using keys\n"
+        "  --password               Prompt for the SSH password without trying keys first\n"
         "  --proxy-user user        Require proxy username/password authentication\n"
         "                           and prompt for the proxy password\n"
         "  --proxy-password-env var Read the proxy password from this environment variable\n"
@@ -48,6 +52,7 @@ static void usage(FILE *stream)
         "  --rewrite-http           Rewrite HTTP traffic in SOCKS and HTTP listeners\n"
         "  --batch                  Reject unknown host keys without prompting\n"
         "  -h, --help               Show this help\n"
+        "  --version                Show the version\n"
         "\n"
         "Without --proxy-user, both listeners need no credentials. Chrome SOCKS requires this.\n"
         "Connection settings, including ProxyJump, are resolved with ssh -G.\n"
@@ -194,6 +199,7 @@ static OuterSSHError check_host_key(HostTrust *trust, const void *key, size_t le
 typedef struct {
     void *semaphore;
     bool succeeded;
+    bool authentication_failed;
     int port;
 } Completion;
 
@@ -235,6 +241,15 @@ static void trust_pool(OuterSSHSessionPool *pool, HostTrust *trust)
     events.pools[events.pool_count++] = (PoolTrust){.pool = pool, .trust = trust};
 }
 
+static void forget_pool(OuterSSHSessionPool *pool)
+{
+    for (size_t i = 0; i < events.pool_count; i++) {
+        if (events.pools[i].pool != pool) continue;
+        events.pools[i] = events.pools[--events.pool_count];
+        return;
+    }
+}
+
 static HostTrust *pool_trust(OuterSSHSessionPool *pool)
 {
     for (size_t i = 0; i < events.pool_count; i++) if (events.pools[i].pool == pool) return events.pools[i].trust;
@@ -246,8 +261,15 @@ static void complete(const OuterSSHEvent *event)
     Completion *completion = (Completion *)(uintptr_t)event->tag;
     OuterSSHError error = event->operation_completed.error;
     completion->succeeded = error.domain == OUTERSSH_ERROR_NONE;
+    completion->authentication_failed = false;
     if (event->type == OUTERSSH_EVENT_DESTROYED) completion->succeeded = true;
-    else if (!completion->succeeded) print_error(error);
+    else if (!completion->succeeded) {
+        completion->authentication_failed = error.domain == OUTERSSH_ERROR_SESSION &&
+            error.code == OUTERSSH_SESSION_ERROR_AUTHENTICATION_FAILED;
+        if (!completion->authentication_failed) print_error(error);
+        else if (error.ssh_error_code == LIBSSH2_ERROR_METHOD_NOT_SUPPORTED)
+            fprintf(stderr, "outerssh: %.*s\n", (int)error.message_length, error.message);
+    }
     else if (event->type == OUTERSSH_EVENT_PROXY_STARTED) completion->port = event->proxy_started.listen_port;
     else if (event->type == OUTERSSH_EVENT_PORT_FORWARD_STARTED) completion->port = event->port_forward_started.listen_port;
     cli_semaphore_signal(completion->semaphore);
@@ -499,6 +521,74 @@ static int invalid_arguments(void)
     return 2;
 }
 
+/* How many passwords to prompt for, following the resolved OpenSSH
+ * configuration. Zero when batch mode or the configuration rules out password
+ * and keyboard-interactive authentication. */
+static int password_prompts(Configuration *configuration, bool batch)
+{
+    if (batch) return 0;
+    if (equals(configuration_value(configuration, "passwordauthentication"), "no") &&
+        equals(configuration_value(configuration, "kbdinteractiveauthentication"), "no")) return 0;
+    int prompts = 3;
+    const char *value = configuration_value(configuration, "numberofpasswordprompts");
+    if (value != NULL && !parse_port(value, true, &prompts)) prompts = 3;
+    return prompts;
+}
+
+/* Creates a pool and connects its first session. On failure, destroys the pool
+ * and leaves authentication_failed set when the server rejected the
+ * credentials. */
+static OuterSSHSessionPool *start_pool(OuterSSHEventQueue *event_queue,
+    const OuterSSHSessionPoolConfiguration *configuration, HostTrust *trust, Completion *completion)
+{
+    OuterSSHError error = {0};
+    completion->authentication_failed = false;
+    OuterSSHSessionPool *pool = outerssh_session_pool_create(event_queue, configuration, &error);
+    if (pool == NULL) { print_error(error); return NULL; }
+    trust_pool(pool, trust);
+    submitted(completion, outerssh_session_pool_ensure_session(pool, tag(completion)));
+    if (wait_for_operation(completion)) return pool;
+    bool authentication_failed = completion->authentication_failed;
+    submitted(completion, outerssh_session_pool_destroy(pool, tag(completion)));
+    cli_semaphore_wait(completion->semaphore);
+    forget_pool(pool);
+    completion->authentication_failed = authentication_failed;
+    return NULL;
+}
+
+/* Connects with the configured key or agent when try_configured is set, then,
+ * like OpenSSH, prompts for up to prompts passwords while the server rejects
+ * the credentials. The pool keeps the password for reconnecting. */
+static OuterSSHSessionPool *connect_pool(OuterSSHEventQueue *event_queue,
+    OuterSSHSessionPoolConfiguration configuration, bool try_configured, int prompts,
+    HostTrust *trust, Completion *completion)
+{
+    if (try_configured) {
+        OuterSSHSessionPool *pool = start_pool(event_queue, &configuration, trust, completion);
+        if (pool != NULL || !completion->authentication_failed) return pool;
+    }
+    char prompt[1400];
+    snprintf(prompt, sizeof(prompt), "%.*s@%.*s's password: ", (int)configuration.username_length,
+        configuration.username, (int)configuration.hostname_length, configuration.hostname);
+    for (int attempt = 0; attempt < prompts; attempt++) {
+        if (attempt != 0) fputs("Permission denied, please try again.\n", stderr);
+        char password[4096] = {0};
+        if (!cli_prompt(prompt, password, sizeof(password), false)) {
+            clear_secret(password, sizeof(password));
+            fputs("outerssh: unable to read the SSH password.\n", stderr);
+            return NULL;
+        }
+        configuration.authentication = (OuterSSHSessionAuthentication){
+            .kind = OUTERSSH_SESSION_AUTHENTICATION_PASSWORD,
+            .password = password, .password_length = strlen(password)};
+        OuterSSHSessionPool *pool = start_pool(event_queue, &configuration, trust, completion);
+        clear_secret(password, sizeof(password));
+        if (pool != NULL || !completion->authentication_failed) return pool;
+    }
+    fputs("outerssh: SSH authentication failed.\n", stderr);
+    return NULL;
+}
+
 static bool connect_jump_hosts(const char *route, const char *config_file, const char *known_hosts,
     bool batch, bool ask_passphrase, const char *default_agent, unsigned depth, OuterSSHEventQueue *event_queue,
     OuterSSHSessionPool **pools, size_t *pool_count, Completion *completion)
@@ -516,7 +606,7 @@ static bool connect_jump_hosts(const char *route, const char *config_file, const
             destination = cli_allocate(strlen(cursor) + 7);
             snprintf(destination, strlen(cursor) + 7, "ssh://%s", cursor);
         }
-        char *arguments[8] = {"ssh", "-G"}; size_t count = 2;
+        char *arguments[8] = {"ssh", "-G", "-T"}; size_t count = 3;
         if (config_file) { arguments[count++] = "-F"; arguments[count++] = (char *)config_file; }
         arguments[count++] = "--"; arguments[count++] = destination;
         Configuration *configuration = resolve_configuration(arguments);
@@ -552,10 +642,15 @@ static bool connect_jump_hosts(const char *route, const char *config_file, const
         if (!agent) agent = "\\\\.\\pipe\\openssh-ssh-agent";
 #endif
         if (equals(agent, "none") || equals(configuration_value(configuration, "identitiesonly"), "yes")) agent = NULL;
-        bool password = !identity && !agent;
+        bool try_configured = identity || agent;
+        int prompts = password_prompts(configuration, batch);
+        if (!try_configured && prompts == 0) {
+            fprintf(stderr, "outerssh: no identity, SSH agent, or password authentication is available for %s.\n", host);
+            return false;
+        }
         char secret[4096] = {0};
-        if (password || (identity && ask_passphrase)) {
-            char prompt[1400]; snprintf(prompt, sizeof(prompt), "%s@%s %s: ", user, host, password ? "password" : "key passphrase");
+        if (identity && ask_passphrase) {
+            char prompt[1400]; snprintf(prompt, sizeof(prompt), "%s@%s key passphrase: ", user, host);
             if (batch || !cli_prompt(prompt, secret, sizeof(secret), false)) return false;
         }
         size_t key_length = 0;
@@ -573,20 +668,16 @@ static bool connect_jump_hosts(const char *route, const char *config_file, const
         OuterSSHSessionPoolConfiguration pool_configuration = {
             .jump_host = *pool_count ? pools[*pool_count - 1] : NULL,
             .hostname = host, .hostname_length = strlen(host), .username = user, .username_length = strlen(user), .port = port,
-            .authentication = {.kind = password ? OUTERSSH_SESSION_AUTHENTICATION_PASSWORD : identity ? OUTERSSH_SESSION_AUTHENTICATION_PRIVATE_KEY : OUTERSSH_SESSION_AUTHENTICATION_AGENT,
+            .authentication = {.kind = identity ? OUTERSSH_SESSION_AUTHENTICATION_PRIVATE_KEY : OUTERSSH_SESSION_AUTHENTICATION_AGENT,
                 .private_key = key, .private_key_length = key_length,
-                .password = password ? secret : NULL, .password_length = password ? strlen(secret) : 0,
                 .passphrase = identity && ask_passphrase ? secret : NULL, .passphrase_length = identity && ask_passphrase ? strlen(secret) : 0},
             .ssh_agent_socket_path = agent, .ssh_agent_socket_path_length = text_length(agent),
         };
-        OuterSSHError error = {0};
-        OuterSSHSessionPool *pool = outerssh_session_pool_create(event_queue, &pool_configuration, &error);
+        OuterSSHSessionPool *pool = connect_pool(event_queue, pool_configuration, try_configured, prompts,
+            trust, completion);
         clear_secret(secret, sizeof(secret)); clear_secret(key, key_length);
-        if (!pool) { print_error(error); return false; }
+        if (!pool) return false;
         pools[(*pool_count)++] = pool;
-        trust_pool(pool, trust);
-        submitted(completion, outerssh_session_pool_ensure_session(pool, tag(completion)));
-        if (!wait_for_operation(completion)) return false;
         if (next && !*next) return false;
         cursor = next;
     }
@@ -610,6 +701,7 @@ static int run(int argc, char **argv)
             continue;
         }
         if (equals(argument, "--help") || equals(argument, "-h")) { usage(stdout); return EXIT_SUCCESS; }
+        if (equals(argument, "--version")) { printf("outerssh %s\n", OUTERSSH_CLI_VERSION); return EXIT_SUCCESS; }
         if (equals(argument, "--ask-passphrase")) { ask_passphrase = true; continue; }
         if (equals(argument, "--password")) { use_password = true; continue; }
         if (equals(argument, "--batch")) { batch = true; continue; }
@@ -679,8 +771,8 @@ static int run(int argc, char **argv)
     bool explicit_identity = identity != NULL;
     char port_text[16];
     snprintf(port_text, sizeof(port_text), "%d", ssh_port);
-    char *config_arguments[18] = {"ssh", "-G"};
-    size_t count = 2;
+    char *config_arguments[18] = {"ssh", "-G", "-T"};
+    size_t count = 3;
     if (config_file != NULL) { config_arguments[count++] = "-F"; config_arguments[count++] = config_file; }
     if (ssh_port != 0) { config_arguments[count++] = "-p"; config_arguments[count++] = port_text; }
     if (user != NULL) { config_arguments[count++] = "-l"; config_arguments[count++] = user; }
@@ -756,15 +848,16 @@ static int run(int argc, char **argv)
         perror("outerssh: unable to disable SSH agent");
         return EXIT_FAILURE;
     }
-    if (!use_password && identity == NULL && agent == NULL) {
-        fprintf(stderr, "outerssh: no configured identity or SSH agent is available; supply -i or --password.\n");
+    bool try_configured = !use_password && (identity != NULL || agent != NULL);
+    int prompts = password_prompts(configuration, batch);
+    if (!try_configured && prompts == 0) {
+        fprintf(stderr, "outerssh: no identity, SSH agent, or password authentication is available; supply -i.\n");
         return EXIT_FAILURE;
     }
     char *host_key_alias = configuration_value(configuration, "hostkeyalias");
     if (!cli_prepare_signals()) { fputs("outerssh: unable to install signal handlers.\n", stderr); return EXIT_FAILURE; }
     char secret[4096] = {0}, proxy_password[256] = {0};
-    if ((use_password || ask_passphrase) && !cli_prompt(use_password ? "SSH password: " : "Key passphrase: ",
-            secret, sizeof(secret), false)) {
+    if (ask_passphrase && !cli_prompt("Key passphrase: ", secret, sizeof(secret), false)) {
         fprintf(stderr, "outerssh: unable to read SSH credentials.\n");
         clear_secret(secret, sizeof(secret));
         return EXIT_FAILURE;
@@ -800,11 +893,10 @@ static int run(int argc, char **argv)
         .hostname = host, .hostname_length = text_length(host),
         .username = user, .username_length = text_length(user),
         .port = ssh_port,
-        .authentication = {.kind = use_password ? OUTERSSH_SESSION_AUTHENTICATION_PASSWORD
-                : identity == NULL ? OUTERSSH_SESSION_AUTHENTICATION_AGENT : OUTERSSH_SESSION_AUTHENTICATION_PRIVATE_KEY,
+        .authentication = {.kind = identity == NULL ? OUTERSSH_SESSION_AUTHENTICATION_AGENT
+                : OUTERSSH_SESSION_AUTHENTICATION_PRIVATE_KEY,
             .private_key = key, .private_key_length = key_length,
-            .passphrase = ask_passphrase ? secret : NULL, .passphrase_length = ask_passphrase ? strlen(secret) : 0,
-            .password = use_password ? secret : NULL, .password_length = use_password ? strlen(secret) : 0},
+            .passphrase = ask_passphrase ? secret : NULL, .passphrase_length = ask_passphrase ? strlen(secret) : 0},
         .ssh_agent_socket_path = agent,
         .ssh_agent_socket_path_length = agent == NULL ? 0 : strlen(agent),
     };
@@ -830,20 +922,19 @@ static int run(int argc, char **argv)
     bool route_ready = event_queue != NULL && connect_jump_hosts(jump_hosts, config_file, known_hosts_override,
         batch, ask_passphrase, default_agent, 0, event_queue, jump_pools, &jump_count, &completion);
     pool_configuration.jump_host = jump_count ? jump_pools[jump_count - 1] : NULL;
-    OuterSSHSessionPool *pool = route_ready ? outerssh_session_pool_create(event_queue, &pool_configuration, &error) : NULL;
-    if (pool != NULL) trust_pool(pool, &trust);
+    OuterSSHSessionPool *pool = route_ready ? connect_pool(event_queue, pool_configuration, try_configured, prompts,
+        &trust, &completion) : NULL;
     clear_secret(secret, sizeof(secret));
     if (key_length != 0) clear_secret(key, key_length);
     OuterSSHSOCKSProxyServer *server = pool == NULL || local_port < 0 ? NULL : outerssh_socks_proxy_server_create(pool, &proxy_configuration, &error);
     OuterSSHHTTPProxyServer *http_server = NULL;
     int status = EXIT_FAILURE;
-    if (pool == NULL || (local_port >= 0 && server == NULL)) {
+    if (pool == NULL) goto cleanup;
+    if (local_port >= 0 && server == NULL) {
         if (error.domain != OUTERSSH_ERROR_NONE) print_error(error);
         else fprintf(stderr, "outerssh: unable to allocate proxy resources.\n");
         goto cleanup;
     }
-    submitted(&completion, outerssh_session_pool_ensure_session(pool, tag(&completion)));
-    if (!wait_for_operation(&completion)) goto cleanup;
     int socks_port = -1;
     if (server != NULL) {
         submitted(&completion, outerssh_socks_proxy_server_start(server, local_port, tag(&completion)));
