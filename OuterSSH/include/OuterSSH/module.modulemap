@@ -1,0 +1,8 @@
+module OuterSSH {
+    umbrella header "OuterSSH.h"
+    textual header "OTNullability.h"
+    export *
+    link "OuterSSH"
+    link "z"
+    link framework "Security"
+}
