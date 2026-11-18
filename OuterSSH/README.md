@@ -1292,6 +1292,8 @@ macOS directory layouts; they do not change the machine's actual configuration.
 endpoint once, in registration order, with conflicting registrations left out.
 Look up one endpoint with `outerssh_endpoint_records_find`, and keep records
 past the next poll with `outerssh_endpoint_records_copy`.
+Publishers register only endpoints that are running or start on connection,
+so clients can offer the records as destinations.
 See `docs/homepage-endpoint-names.md`.
 
 The socket helper also keeps a per-user endpoint icon cache next to `endpoints.d`:
