@@ -61,7 +61,3 @@ ctest --test-dir build --output-on-failure
 `Scripts/test_outerssh_linux.sh` builds and tests in a Linux container with Docker,
 including integration tests against a real `sshd`.
 
-## Development
-
-OuterSSH is developed inside the Outer Loop repository, and this repository is
-updated from it periodically. Issues and discussion are welcome here.
